@@ -330,6 +330,46 @@ class TestPeerLookupHelpers:
         assert "fallback hit" in result
         peer_obj.search.assert_called_once()
 
+    def test_search_context_bounds_token_dense_query_for_primary_and_fallback(self):
+        """Manual search must use the same safe query for either search route."""
+        mgr, session = self._make_cached_manager()
+        query = "HEAD-KEEP " + ("🧪?!🧬" * 2_000) + " TAIL-KEEP"
+        honcho_client = MagicMock()
+        honcho_client.search.side_effect = RuntimeError("peer_perspective unsupported")
+        peer_obj = MagicMock()
+        peer_obj.search.return_value = [
+            SimpleNamespace(content="fallback hit", peer_id="robert", session_id="s1", id="m1"),
+        ]
+        mgr._get_or_create_peer = MagicMock(return_value=peer_obj)
+
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context(session.key, query)
+
+        assert "fallback hit" in result
+        primary_query = honcho_client.search.call_args.args[0]
+        fallback_query = peer_obj.search.call_args.args[0]
+        assert primary_query == fallback_query
+        assert len(primary_query.encode("utf-8")) <= 1_024
+        assert primary_query.startswith("HEAD-KEEP")
+        assert primary_query.endswith("TAIL-KEEP")
+
+    def test_search_context_replaces_lone_surrogate_before_retrieval(self):
+        """Malformed Unicode must not make the new UTF-8 boundary raise."""
+        mgr, session = self._make_cached_manager()
+        honcho_client = MagicMock()
+        honcho_client.search.return_value = [
+            SimpleNamespace(content="lone surrogate hit", peer_id="robert", session_id="s1", id="m1"),
+        ]
+        query = "HEAD-KEEP " + chr(0xD800) + " TAIL-KEEP"
+
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context(session.key, query)
+
+        assert result == "[robert · s1] lone surrogate hit"
+        bounded_query = honcho_client.search.call_args.args[0]
+        assert chr(0xD800) not in bounded_query
+        bounded_query.encode("utf-8")
+
     def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
         mgr, session = self._make_cached_manager()
         user_peer = MagicMock()
@@ -360,6 +400,27 @@ class TestPeerLookupHelpers:
         }
         user_peer.context.assert_called_once_with(target=session.user_peer_id)
         ai_peer.context.assert_called_once_with(target=session.assistant_peer_id)
+
+    def test_get_prefetch_context_bounds_token_dense_query_and_preserves_head_tail(self):
+        """Prefetch must keep retrieval input safely below Honcho's token cap."""
+        mgr, session = self._make_cached_manager()
+        peer = MagicMock()
+        peer.context.return_value = SimpleNamespace(representation="", peer_card=[])
+        peer.representation.return_value = ""
+        peer.get_card.return_value = []
+        mgr._get_or_create_peer = MagicMock(return_value=peer)
+        query = "HEAD-KEEP " + ("🧪?!🧬" * 2_000) + " TAIL-KEEP"
+
+        mgr.get_prefetch_context(session.key, query)
+
+        query_call = next(
+            call for call in peer.context.call_args_list
+            if call.kwargs.get("search_query") is not None
+        )
+        bounded_query = query_call.kwargs["search_query"]
+        assert len(bounded_query.encode("utf-8")) <= 1_024
+        assert bounded_query.startswith("HEAD-KEEP")
+        assert bounded_query.endswith("TAIL-KEEP")
 
     def test_get_prefetch_context_uses_assistant_observer_for_user_when_ai_observe_others(self):
         """With ai_observe_others enabled, get_prefetch_context must query

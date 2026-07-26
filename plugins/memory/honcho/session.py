@@ -23,6 +23,28 @@ _ASYNC_SHUTDOWN = object()
 _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
 
+# Honcho's retrieval endpoints reject inputs over 2,048 tokens. Keep query
+# payloads to half that limit without adding a tokenizer dependency: a
+# byte-based tokenizer cannot emit more input tokens than UTF-8 bytes, and the
+# unused half reserves room for service framing and special tokens.
+_MAX_RETRIEVAL_QUERY_UTF8_BYTES = 1_024
+_RETRIEVAL_QUERY_TRUNCATION_MARKER = " … "
+
+
+def _bound_retrieval_query(query: str) -> str:
+    """Normalize and preserve a retrieval query within a UTF-8 byte cap."""
+    encoded = query.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_RETRIEVAL_QUERY_UTF8_BYTES:
+        return encoded.decode("utf-8")
+
+    marker_bytes = _RETRIEVAL_QUERY_TRUNCATION_MARKER.encode("utf-8")
+    content_budget = _MAX_RETRIEVAL_QUERY_UTF8_BYTES - len(marker_bytes)
+    head_budget = (content_budget + 1) // 2
+    tail_budget = content_budget - head_budget
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore")
+    return f"{head}{_RETRIEVAL_QUERY_TRUNCATION_MARKER}{tail}"
+
 
 @dataclass
 class HonchoSession:
@@ -743,7 +765,8 @@ class HonchoSessionManager:
 
         try:
             observer_peer_id, target_peer_id = self._resolve_observer_target(session, "user")
-            user_ctx = self._fetch_peer_context(observer_peer_id, search_query=user_message or None, target=target_peer_id or session.user_peer_id)
+            search_query = _bound_retrieval_query(user_message) if user_message else None
+            user_ctx = self._fetch_peer_context(observer_peer_id, search_query=search_query, target=target_peer_id or session.user_peer_id)
             result["representation"] = user_ctx["representation"]
             result["card"] = "\n".join(user_ctx["card"])
         except Exception as e:
@@ -1142,12 +1165,11 @@ class HonchoSessionManager:
         # peer_perspective spans the target peer's sessions across all authors.
         peer_id = self._resolve_peer_id(session, peer)
 
-        # Honcho caps query length for the embedding model; keep well under it.
-        q = (query or "").strip()
+        # Bound by UTF-8 bytes rather than characters so dense Unicode and
+        # punctuation also stay safely below Honcho's retrieval token cap.
+        q = _bound_retrieval_query((query or "").strip())
         if not q:
             return ""
-        if len(q) > 4000:
-            q = q[:4000]
 
         # Approximate four characters per token and a few hundred per result.
         char_budget = max(200, int(max_tokens) * 4)
